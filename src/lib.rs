@@ -76,7 +76,7 @@ fn scan(code: &str) -> Vec<(Tok, usize)> {
     toks
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Expr {
     Var(String),
     String(String),
@@ -180,7 +180,7 @@ fn parse(code: &str) -> Result<Expr, String> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Env {
     Nil,
     Entry(String, Val, Rc<Env>),
@@ -200,11 +200,29 @@ impl Env {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Val {
     String(String),
     TimeLoop(Vec<Val>),
     Lambda(String, Box<Expr>, Rc<Env>),
+}
+
+fn simplify_time_loop(vals: Vec<Val>) -> Vec<Val> {
+    if vals.is_empty() {
+        return vals;
+    }
+    let n = vals.len();
+    let mut period_len = 1;
+    for i in 1..n {
+        if vals[i] != vals[i % period_len] {
+            period_len = i + 1;
+        }
+    }
+    if n % period_len == 0 {
+        vals[0..period_len].to_vec()
+    } else {
+        vals
+    }
 }
 
 impl Val {
@@ -213,71 +231,6 @@ impl Val {
             Val::String(_) | Val::Lambda(_, _, _) => 0,
             Val::TimeLoop(vals) => vals.iter().map(|v| v.depth()).max().unwrap_or_default() + 1,
         }
-    }
-}
-
-fn eq(a: &Val, b: &Val) -> Result<Val, String> {
-    fn _true() -> Val {
-        Val::Lambda(
-            "x".into(),
-            Box::new(Expr::Lambda("y".into(), Box::new(Expr::Var("x".into())))),
-            Rc::new(Env::Nil),
-        )
-    }
-    fn _false() -> Val {
-        Val::Lambda(
-            "x".into(),
-            Box::new(Expr::Lambda("y".into(), Box::new(Expr::Var("y".into())))),
-            Rc::new(Env::Nil),
-        )
-    }
-    match (a, b) {
-        (Val::String(a), Val::String(b)) if a == b => Ok(_true()),
-        (Val::String(_), Val::String(_)) => Ok(_false()),
-        (a @ Val::String(_), Val::TimeLoop(b)) => Ok(Val::TimeLoop(
-            b.iter().map(|b| eq(a, b)).collect::<Result<_, _>>()?,
-        )),
-        (Val::TimeLoop(a), b @ Val::String(_)) => Ok(Val::TimeLoop(
-            a.iter().map(|a| eq(a, b)).collect::<Result<_, _>>()?,
-        )),
-        (Val::TimeLoop(a), Val::TimeLoop(b)) => todo!(),
-        (a @ Val::Lambda(_, _, _), b) | (a, b @ Val::Lambda(_, _, _)) => {
-            Err(format!("Cannot compare {a} with {b}"))
-        }
-    }
-}
-
-fn app(f: Val, arg: Val) -> Result<Val, String> {
-    let depth_f = f.depth();
-    let depth_arg = arg.depth();
-    match (f, arg) {
-        (Val::Lambda(v, body, env), arg) => {
-            let env = env.set(v, arg);
-            body.eval(&Rc::new(env))
-        }
-        (Val::TimeLoop(fs), Val::TimeLoop(args)) => {
-            if depth_f > depth_arg {
-                Ok(Val::TimeLoop(
-                    fs.into_iter()
-                        .map(|f| app(f, Val::TimeLoop(args.clone())))
-                        .collect::<Result<_, _>>()?,
-                ))
-            } else if depth_f < depth_arg {
-                Ok(Val::TimeLoop(
-                    args.into_iter()
-                        .map(|arg| app(Val::TimeLoop(fs.clone()), arg))
-                        .collect::<Result<_, _>>()?,
-                ))
-            } else {
-                todo!()
-            }
-        }
-        (Val::TimeLoop(fs), arg) => Ok(Val::TimeLoop(
-            fs.into_iter()
-                .map(|f| app(f, arg.clone()))
-                .collect::<Result<_, _>>()?,
-        )),
-        (s @ Val::String(_), arg) => Err(format!("Cannot apply the string {s} to the value {arg}")),
     }
 }
 
@@ -300,10 +253,94 @@ impl std::fmt::Display for Val {
     }
 }
 
+fn eq(a: &Val, b: &Val) -> Result<Val, String> {
+    fn _true() -> Val {
+        Val::Lambda(
+            "x".into(),
+            Box::new(Expr::Lambda("y".into(), Box::new(Expr::Var("x".into())))),
+            Rc::new(Env::Nil),
+        )
+    }
+    fn _false() -> Val {
+        Val::Lambda(
+            "x".into(),
+            Box::new(Expr::Lambda("y".into(), Box::new(Expr::Var("y".into())))),
+            Rc::new(Env::Nil),
+        )
+    }
+    let depth_a = a.depth();
+    let depth_b = b.depth();
+    match (a, b) {
+        (Val::String(a), Val::String(b)) if a == b => Ok(_true()),
+        (Val::String(_), Val::String(_)) => Ok(_false()),
+        (a @ Val::String(_), Val::TimeLoop(b)) => Ok(Val::TimeLoop(simplify_time_loop(
+            b.iter().map(|b| eq(a, b)).collect::<Result<_, _>>()?,
+        ))),
+        (Val::TimeLoop(a), b @ Val::String(_)) => Ok(Val::TimeLoop(simplify_time_loop(
+            a.iter().map(|a| eq(a, b)).collect::<Result<_, _>>()?,
+        ))),
+        (Val::TimeLoop(vals_a), Val::TimeLoop(vals_b)) => {
+            let vals = if depth_a > depth_b {
+                vals_a.iter().map(|a| eq(a, b)).collect::<Result<_, _>>()?
+            } else if depth_a < depth_b {
+                vals_b.iter().map(|b| eq(a, b)).collect::<Result<_, _>>()?
+            } else {
+                let n = vals_a.len() * vals_b.len();
+                let x: Vec<&Val> = vals_a.into_iter().cycle().take(n).collect();
+                let y: Vec<&Val> = vals_b.into_iter().cycle().take(n).collect();
+                x.into_iter()
+                    .zip(y.into_iter())
+                    .map(|(x, y)| eq(x, y))
+                    .collect::<Result<_, _>>()?
+            };
+            Ok(Val::TimeLoop(simplify_time_loop(vals)))
+        }
+        (a @ Val::Lambda(_, _, _), b) | (a, b @ Val::Lambda(_, _, _)) => {
+            Err(format!("Cannot compare {a} with {b}"))
+        }
+    }
+}
+
+fn app(f: Val, arg: Val) -> Result<Val, String> {
+    let depth_f = f.depth();
+    let depth_arg = arg.depth();
+    match (f, arg) {
+        (Val::Lambda(v, body, env), arg) => {
+            let env = env.set(v, arg);
+            body.eval(&Rc::new(env))
+        }
+        (Val::TimeLoop(fs), Val::TimeLoop(args)) => {
+            let vals = if depth_f > depth_arg {
+                fs.into_iter()
+                    .map(|f| app(f, Val::TimeLoop(args.clone())))
+                    .collect::<Result<_, _>>()?
+            } else if depth_f < depth_arg {
+                args.into_iter()
+                    .map(|arg| app(Val::TimeLoop(fs.clone()), arg))
+                    .collect::<Result<_, _>>()?
+            } else {
+                let fs_len = fs.len();
+                let x: Vec<Val> = fs.into_iter().cycle().take(args.len()).collect();
+                let y: Vec<Val> = args.into_iter().cycle().take(fs_len).collect();
+                x.into_iter()
+                    .zip(y.into_iter())
+                    .map(|(f, arg)| app(f, arg))
+                    .collect::<Result<_, _>>()?
+            };
+            Ok(Val::TimeLoop(simplify_time_loop(vals)))
+        }
+        (Val::TimeLoop(fs), arg) => Ok(Val::TimeLoop(simplify_time_loop(
+            fs.into_iter()
+                .map(|f| app(f, arg.clone()))
+                .collect::<Result<_, _>>()?,
+        ))),
+        (s @ Val::String(_), arg) => Err(format!("Cannot apply the string {s} to the value {arg}")),
+    }
+}
+
 impl Expr {
     fn eval(self, env: &Rc<Env>) -> Result<Val, String> {
-        println!("--> {self:?}, {env:?}");
-        let v = match self {
+        match self {
             Expr::Var(v) => env.get(&v).cloned(),
             Expr::String(s) => Ok(Val::String(s)),
             Expr::Eq([a, b]) => {
@@ -323,9 +360,7 @@ impl Expr {
                 let arg = arg.eval(env)?;
                 app(f, arg)
             }
-        };
-        println!("----> {v:?}");
-        v
+        }
     }
 }
 
@@ -375,6 +410,21 @@ mod tests {
         let code = format!(
             r#"
         if {v} == "x":
+            "y"
+        else:
+            "x"
+        "#
+        );
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn captured_liar() -> Result<(), String> {
+        let v = r#"[["x"]; ["y"; "x"]]"#;
+        let code = format!(
+            r#"
+        if {v} == ["x"; "y"]:
             "y"
         else:
             "x"
