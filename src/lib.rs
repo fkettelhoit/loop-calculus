@@ -248,7 +248,7 @@ impl std::fmt::Display for Val {
                 }
                 f.write_str("]")
             }
-            Val::Lambda(v, _, _) => write!(f, "{v} => <body>"),
+            Val::Lambda(v, body, env) => write!(f, "{v} => {body:?}@{env:?}"),
         }
     }
 }
