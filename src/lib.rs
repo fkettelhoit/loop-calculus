@@ -20,7 +20,7 @@ impl std::fmt::Display for Tok<'_> {
         f.write_str("'")?;
         match self {
             Tok::Keyword(s) | Tok::Ident(s) => f.write_str(s),
-            Tok::String(s) => write!(f, "\"{s}\""),
+            Tok::String(s) => write!(f, "'{s}'"),
             Tok::LParen => f.write_str("("),
             Tok::RParen => f.write_str(")"),
             Tok::LBracket => f.write_str("["),
@@ -50,7 +50,7 @@ fn scan(code: &str) -> Vec<(Tok, usize)> {
             _ => None,
         };
         let is_comment = c == '#';
-        let is_str_literal = c == '"';
+        let is_str_literal = c == '\'';
         if tok.is_some() || c.is_whitespace() || is_comment || is_str_literal {
             if !code[i..j].is_empty() {
                 let tok = match &code[i..j] {
@@ -68,7 +68,7 @@ fn scan(code: &str) -> Vec<(Tok, usize)> {
             let (j, _) = chars.find(|(_, c)| *c == '\n').unwrap_or_default();
             i = j + 1;
         } else if is_str_literal {
-            let s = chars.by_ref().take_while(|(_, c)| *c != '"').count();
+            let s = chars.by_ref().take_while(|(_, c)| *c != '\'').count();
             toks.push((Tok::String(&code[j + 1..j + 1 + s]), i));
             i = j + s + 2;
         }
@@ -237,7 +237,7 @@ impl Val {
 impl std::fmt::Display for Val {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Val::String(s) => write!(f, "\"{s}\""),
+            Val::String(s) => write!(f, "'{s}'"),
             Val::TimeLoop(vals) => {
                 f.write_str("[")?;
                 for (i, val) in vals.iter().enumerate() {
@@ -375,30 +375,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn t() -> Result<(), String> {
-        let v = r#""x""#;
+    fn whatever1() -> Result<(), String> {
+        let v = "'x'";
         let code = format!(
-            r#"
-        if {v} == "x":
-            "x"
+            "
+        if {v} == 'x':
+            'x'
         else:
-            "y"
-        "#
+            'y'
+        "
         );
         assert_eq!(eval(&code)?, v);
         Ok(())
     }
 
     #[test]
-    fn f() -> Result<(), String> {
-        let v = r#""y""#;
+    fn whatever2() -> Result<(), String> {
+        let v = "'y'";
         let code = format!(
-            r#"
-        if {v} == "x":
-            "x"
+            "
+        if {v} == 'x':
+            'x'
         else:
-            "y"
-        "#
+            'y'
+        "
         );
         assert_eq!(eval(&code)?, v);
         Ok(())
@@ -406,14 +406,14 @@ mod tests {
 
     #[test]
     fn liar() -> Result<(), String> {
-        let v = r#"["x"; "y"]"#;
+        let v = "['x'; 'y']";
         let code = format!(
-            r#"
-        if {v} == "x":
-            "y"
+            "
+        if {v} == 'x':
+            'y'
         else:
-            "x"
-        "#
+            'x'
+        "
         );
         assert_eq!(eval(&code)?, v);
         Ok(())
