@@ -421,14 +421,110 @@ mod tests {
 
     #[test]
     fn captured_liar() -> Result<(), String> {
-        let v = r#"[["x"]; ["y"; "x"]]"#;
+        let v = "[['x']; ['y'; 'x']]";
         let code = format!(
-            r#"
-        if {v} == ["x"; "y"]:
-            "y"
+            "
+        if {v} == ['x'; 'y']:
+            'y'
         else:
-            "x"
-        "#
+            'x'
+        "
+        );
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn escaped_liar1() -> Result<(), String> {
+        let v = "[['x']; ['x'; 'y']]";
+        let code = format!(
+            "
+        if {v} == ['x'; 'y']:
+            'x'
+        else:
+            if {v} == 'x':
+                'y'
+            else:
+                'x'
+        "
+        );
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn escaped_liar2() -> Result<(), String> {
+        let v = "[['y']; ['x'; 'y']]";
+        let code = format!(
+            "
+        if {v} == ['x'; 'y']:
+            'y'
+        else:
+            if {v} == 'x':
+                'y'
+            else:
+                'x'
+        "
+        );
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn escaped_liar3() -> Result<(), String> {
+        let v = "[['x']; ['z'; 'y']; ['x'; 'z']; ['z'; 'x']; ['x'; 'y']; ['z']]";
+        // x -> [z; y]
+        // [z; y] -> [x; z]
+        // [x; z] -> [z; x]
+        // [z; x] -> [x; y]
+        // [x; y] -> z
+        // z -> x
+        let code = format!(
+            "
+        if {v} == ['x'; 'y']:
+            'z'
+        else:
+            if {v} == 'x':
+                'y'
+            else:
+                'x'
+        "
+        );
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn liar_twin1() -> Result<(), String> {
+        let v = "['x'; 'y']";
+        let code = format!(
+            "
+        if {v} == 'x':
+            'y'
+        else:
+            if {v} == 'x':
+                'y'
+            else:
+                'x'
+        "
+        );
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn liar_twin2() -> Result<(), String> {
+        let v = "['x'; 'y']";
+        let code = format!(
+            "
+        if {v} == 'x':
+            'y'
+        else:
+            if {v} == 'x':
+                'z'
+            else:
+                'x'
+        "
         );
         assert_eq!(eval(&code)?, v);
         Ok(())
