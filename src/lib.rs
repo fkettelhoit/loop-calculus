@@ -319,9 +319,9 @@ fn app(f: Val, arg: Val) -> Result<Val, String> {
                     .map(|arg| app(Val::TimeLoop(fs.clone()), arg))
                     .collect::<Result<_, _>>()?
             } else {
-                let fs_len = fs.len();
-                let x: Vec<Val> = fs.into_iter().cycle().take(args.len()).collect();
-                let y: Vec<Val> = args.into_iter().cycle().take(fs_len).collect();
+                let n = fs.len() * args.len();
+                let x: Vec<Val> = fs.into_iter().cycle().take(n).collect();
+                let y: Vec<Val> = args.into_iter().cycle().take(n).collect();
                 x.into_iter()
                     .zip(y.into_iter())
                     .map(|(f, arg)| app(f, arg))
