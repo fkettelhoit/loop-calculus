@@ -1,8 +1,4 @@
-use std::{iter, vec::IntoIter};
-
-pub fn eval(code: &str) -> String {
-    format!("{:?}", parse(code))
-}
+use std::{iter, rc::Rc, vec::IntoIter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tok<'code> {
@@ -85,8 +81,9 @@ enum Expr {
     Var(String),
     String(String),
     Eq([Box<Expr>; 2]),
-    Conditional([Box<Expr>; 3]),
     TimeLoop(Vec<Expr>),
+    Lambda(String, Box<Expr>),
+    App([Box<Expr>; 2]),
 }
 
 fn pos_at(i: usize, code: &str) -> String {
@@ -120,7 +117,10 @@ fn parse(code: &str) -> Result<Expr, String> {
                 expect(toks, Tok::Keyword("else"))?;
                 expect(toks, Tok::Colon)?;
                 let f = parse_expr(toks)?;
-                Ok(Expr::Conditional([Box::new(p), Box::new(t), Box::new(f)]))
+                Ok(Expr::App([
+                    Box::new(Expr::App([Box::new(p), Box::new(t)])),
+                    Box::new(f),
+                ]))
             }
             _ => parse_infix(toks),
         }
@@ -180,14 +180,157 @@ fn parse(code: &str) -> Result<Expr, String> {
     }
 }
 
+#[derive(Debug, Clone)]
+enum Env {
+    Nil,
+    Entry(String, Val, Rc<Env>),
+}
+
+impl Env {
+    fn set(self: &Rc<Self>, k: String, v: Val) -> Env {
+        Env::Entry(k, v, Rc::clone(&self))
+    }
+
+    fn get(&self, var: &str) -> Result<&Val, String> {
+        match self {
+            Env::Nil => Err(format!("Unbound variable {var}")),
+            Env::Entry(k, val, _) if k == var => Ok(val),
+            Env::Entry(_, _, env) => env.get(var),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Val {
+    String(String),
+    TimeLoop(Vec<Val>),
+    Lambda(String, Box<Expr>, Rc<Env>),
+}
+
+impl std::fmt::Display for Val {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Val::String(s) => write!(f, "\"{s}\""),
+            Val::TimeLoop(vals) => {
+                f.write_str("[")?;
+                for (i, val) in vals.iter().enumerate() {
+                    if i != 0 {
+                        f.write_str("; ")?;
+                    }
+                    write!(f, "{val}")?;
+                }
+                f.write_str("]")
+            }
+            Val::Lambda(v, _, _) => write!(f, "{v} => <body>"),
+        }
+    }
+}
+
+impl Expr {
+    fn eval(self, env: &Rc<Env>) -> Result<Val, String> {
+        println!("--> {self:?}, {env:?}");
+        fn _true() -> Val {
+            Val::Lambda(
+                "x".into(),
+                Box::new(Expr::Lambda("y".into(), Box::new(Expr::Var("x".into())))),
+                Rc::new(Env::Nil),
+            )
+        }
+        fn _false() -> Val {
+            Val::Lambda(
+                "x".into(),
+                Box::new(Expr::Lambda("y".into(), Box::new(Expr::Var("y".into())))),
+                Rc::new(Env::Nil),
+            )
+        }
+        let v = match self {
+            Expr::Var(v) => {
+                println!("looking up {v} in {env:?}");
+                env.get(&v).cloned()
+            }
+            Expr::String(s) => Ok(Val::String(s)),
+            Expr::Eq([a, b]) => {
+                let a = a.eval(env)?;
+                let b = b.eval(env)?;
+                match (a, b) {
+                    (Val::String(a), Val::String(b)) if a == b => Ok(_true()),
+                    (Val::String(_), Val::String(_)) => Ok(_false()),
+                    (Val::String(a), Val::TimeLoop(b)) => todo!(),
+                    (Val::TimeLoop(a), Val::String(b)) => todo!(),
+                    (Val::TimeLoop(a), Val::TimeLoop(b)) => todo!(),
+                    (a @ Val::Lambda(_, _, _), b) | (a, b @ Val::Lambda(_, _, _)) => {
+                        Err(format!("Cannot compare {a} with {b}"))
+                    }
+                }
+            }
+            Expr::TimeLoop(exprs) => Ok(Val::TimeLoop(
+                exprs
+                    .into_iter()
+                    .map(|v| v.eval(env))
+                    .collect::<Result<_, _>>()?,
+            )),
+            Expr::Lambda(v, body) => Ok(Val::Lambda(v, body, Rc::clone(env))),
+            Expr::App([f, arg]) => match (f.eval(env)?, arg.eval(env)?) {
+                (Val::Lambda(v, body, env), arg) => {
+                    println!("setting {v} to {arg:?} in {env:?}, for body {body:?}");
+                    let env = env.set(v, arg);
+                    body.eval(&Rc::new(env))
+                }
+                (Val::TimeLoop(vals), arg) => todo!(),
+                (s @ Val::String(_), arg) => {
+                    Err(format!("Cannot apply the string {s} to the value {arg}"))
+                }
+            },
+        };
+        println!("----> {v:?}");
+        v
+    }
+}
+
+pub fn eval(code: &str) -> Result<String, String> {
+    let expr = parse(code)?;
+    let val = expr.eval(&Rc::new(Env::Nil))?;
+    Ok(format!("{val}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn liar() {
+    fn t() -> Result<(), String> {
+        let v = r#""x""#;
+        let code = format!(
+            r#"
+        if {v} == "x":
+            "x"
+        else:
+            "y"
+        "#
+        );
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn f() -> Result<(), String> {
+        let v = r#""y""#;
+        let code = format!(
+            r#"
+        if {v} == "x":
+            "x"
+        else:
+            "y"
+        "#
+        );
+        assert_eq!(eval(&code)?, v);
+        Ok(())
+    }
+
+    #[test]
+    fn liar() -> Result<(), String> {
         let v = r#"["x"; "y"]"#;
-        let liar = format!(
+        let code = format!(
             r#"
         if {v} == "x":
             "y"
@@ -195,6 +338,7 @@ mod tests {
             "x"
         "#
         );
-        assert_eq!(eval(&liar), v);
+        assert_eq!(eval(&code)?, v);
+        Ok(())
     }
 }
