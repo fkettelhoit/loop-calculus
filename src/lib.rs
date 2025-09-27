@@ -203,8 +203,12 @@ impl Env {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Val {
     String(String),
-    TimeLoop(Vec<Val>),
     Lambda(String, Box<Expr>, Rc<Env>),
+    TimeLoop {
+        vals: Vec<Val>,
+        step: usize,
+        phase: usize,
+    },
 }
 
 fn simplify_time_loop(vals: Vec<Val>) -> Vec<Val> {
@@ -229,7 +233,9 @@ impl Val {
     fn depth(&self) -> usize {
         match self {
             Val::String(_) | Val::Lambda(_, _, _) => 0,
-            Val::TimeLoop(vals) => vals.iter().map(|v| v.depth()).max().unwrap_or_default() + 1,
+            Val::TimeLoop { vals, .. } => {
+                vals.iter().map(|v| v.depth()).max().unwrap_or_default() + 1
+            }
         }
     }
 }
@@ -238,7 +244,7 @@ impl std::fmt::Display for Val {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Val::String(s) => write!(f, "'{s}'"),
-            Val::TimeLoop(vals) => {
+            Val::TimeLoop { vals, step, phase } => {
                 f.write_str("[")?;
                 for (i, val) in vals.iter().enumerate() {
                     if i != 0 {
@@ -246,7 +252,11 @@ impl std::fmt::Display for Val {
                     }
                     write!(f, "{val}")?;
                 }
-                f.write_str("]")
+                f.write_str("]")?;
+                if *step > 0 || *phase != vals.len() {
+                    write!(f, "@{step}/{phase}")?;
+                }
+                Ok(())
             }
             Val::Lambda(v, body, env) => write!(f, "{v} => {body:?}@{env:?}"),
         }
@@ -273,13 +283,31 @@ fn eq(a: &Val, b: &Val) -> Result<Val, String> {
     match (a, b) {
         (Val::String(a), Val::String(b)) if a == b => Ok(_true()),
         (Val::String(_), Val::String(_)) => Ok(_false()),
-        (a @ Val::String(_), Val::TimeLoop(b)) => Ok(Val::TimeLoop(simplify_time_loop(
-            b.iter().map(|b| eq(a, b)).collect::<Result<_, _>>()?,
-        ))),
-        (Val::TimeLoop(a), b @ Val::String(_)) => Ok(Val::TimeLoop(simplify_time_loop(
-            a.iter().map(|a| eq(a, b)).collect::<Result<_, _>>()?,
-        ))),
-        (Val::TimeLoop(vals_a), Val::TimeLoop(vals_b)) => {
+        (a @ Val::String(_), Val::TimeLoop { vals, step, phase }) => Ok(Val::TimeLoop {
+            step: *step,
+            phase: *phase,
+            vals: simplify_time_loop(vals.iter().map(|b| eq(a, b)).collect::<Result<_, _>>()?),
+        }),
+        (Val::TimeLoop { vals, step, phase }, b @ Val::String(_)) => Ok(Val::TimeLoop {
+            step: *step,
+            phase: *phase,
+            vals: simplify_time_loop(vals.iter().map(|a| eq(a, b)).collect::<Result<_, _>>()?),
+        }),
+        (
+            Val::TimeLoop {
+                vals: vals_a,
+                step: step_a,
+                ..
+            },
+            Val::TimeLoop {
+                vals: vals_b,
+                step: step_b,
+                ..
+            },
+        ) => {
+            if step_a != step_b {
+                return Ok(_false());
+            }
             let vals = if depth_a > depth_b {
                 vals_a.iter().map(|a| eq(a, b)).collect::<Result<_, _>>()?
             } else if depth_a < depth_b {
@@ -293,7 +321,12 @@ fn eq(a: &Val, b: &Val) -> Result<Val, String> {
                     .map(|(x, y)| eq(x, y))
                     .collect::<Result<_, _>>()?
             };
-            Ok(Val::TimeLoop(simplify_time_loop(vals)))
+            let vals = simplify_time_loop(vals);
+            Ok(Val::TimeLoop {
+                step: *step_a,
+                phase: vals.len(),
+                vals,
+            })
         }
         (a @ Val::Lambda(_, _, _), b) | (a, b @ Val::Lambda(_, _, _)) => {
             Err(format!("Cannot compare {a} with {b}"))
@@ -309,31 +342,38 @@ fn app(f: Val, arg: Val) -> Result<Val, String> {
             let env = env.set(v, arg);
             body.eval(&Rc::new(env))
         }
-        (Val::TimeLoop(fs), Val::TimeLoop(args)) => {
-            let vals = if depth_f > depth_arg {
-                fs.into_iter()
-                    .map(|f| app(f, Val::TimeLoop(args.clone())))
-                    .collect::<Result<_, _>>()?
-            } else if depth_f < depth_arg {
-                args.into_iter()
-                    .map(|arg| app(Val::TimeLoop(fs.clone()), arg))
-                    .collect::<Result<_, _>>()?
-            } else {
-                let n = fs.len() * args.len();
-                let x: Vec<Val> = fs.into_iter().cycle().take(n).collect();
-                let y: Vec<Val> = args.into_iter().cycle().take(n).collect();
+
+        (fs @ Val::TimeLoop { .. }, Val::TimeLoop { vals, step, phase }) if depth_f < depth_arg => {
+            let vals = simplify_time_loop(
+                vals.into_iter()
+                    .map(|arg| app(fs.clone(), arg))
+                    .collect::<Result<_, _>>()?,
+            );
+            Ok(Val::TimeLoop { vals, step, phase })
+        }
+        (Val::TimeLoop { vals: fs, step, .. }, Val::TimeLoop { vals: args, .. })
+            if depth_f == depth_arg =>
+        {
+            let n = fs.len() * args.len();
+            let x: Vec<Val> = fs.into_iter().cycle().take(n).collect();
+            let y: Vec<Val> = args.into_iter().cycle().take(n).collect();
+            let vals = simplify_time_loop(
                 x.into_iter()
                     .zip(y.into_iter())
                     .map(|(f, arg)| app(f, arg))
-                    .collect::<Result<_, _>>()?
-            };
-            Ok(Val::TimeLoop(simplify_time_loop(vals)))
+                    .collect::<Result<_, _>>()?,
+            );
+            let phase = vals.len();
+            Ok(Val::TimeLoop { vals, step, phase })
         }
-        (Val::TimeLoop(fs), arg) => Ok(Val::TimeLoop(simplify_time_loop(
-            fs.into_iter()
-                .map(|f| app(f, arg.clone()))
-                .collect::<Result<_, _>>()?,
-        ))),
+        (Val::TimeLoop { vals, step, phase }, arg) => {
+            let vals = simplify_time_loop(
+                vals.into_iter()
+                    .map(|f| app(f, arg.clone()))
+                    .collect::<Result<_, _>>()?,
+            );
+            Ok(Val::TimeLoop { vals, step, phase })
+        }
         (s @ Val::String(_), arg) => Err(format!("Cannot apply the string {s} to the value {arg}")),
     }
 }
@@ -348,17 +388,33 @@ impl Expr {
                 let b = b.eval(env)?;
                 eq(&a, &b)
             }
-            Expr::TimeLoop(exprs) => Ok(Val::TimeLoop(
-                exprs
+            Expr::TimeLoop(vals) => Ok(Val::TimeLoop {
+                step: 0,
+                phase: vals.len(),
+                vals: vals
                     .into_iter()
                     .map(|v| v.eval(env))
                     .collect::<Result<_, _>>()?,
-            )),
+            }),
             Expr::Lambda(v, body) => Ok(Val::Lambda(v, body, Rc::clone(env))),
             Expr::App([f, arg]) => {
                 let f = f.eval(env)?;
-                let arg = arg.eval(env)?;
-                app(f, arg)
+                let mut arg = arg.eval(env)?;
+                if let Val::TimeLoop { vals, step, phase } = &mut arg {
+                    if *step == 0 {
+                        vals.rotate_left(1);
+                        *step += 1;
+                    }
+                }
+                let mut result = app(f, arg)?;
+                if let Val::TimeLoop { vals, step, phase } = &mut result {
+                    *step += 1;
+                    if step == phase {
+                        *step = 0;
+                        vals.rotate_right(1);
+                    }
+                }
+                Ok(result)
             }
         }
     }
