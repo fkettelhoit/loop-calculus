@@ -2,8 +2,10 @@ use std::{iter, rc::Rc, vec::IntoIter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tok<'code> {
+    Num(usize),
     Ident(&'code str),
     String(&'code str),
+    Keyword(&'code str),
     LParen,
     RParen,
     LBracket,
@@ -12,13 +14,15 @@ enum Tok<'code> {
     Semicolon,
     Comma,
     DoubleEq,
-    Keyword(&'code str),
+    At,
+    Slash,
 }
 
 impl std::fmt::Display for Tok<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("'")?;
         match self {
+            Tok::Num(n) => write!(f, "{n}"),
             Tok::Keyword(s) | Tok::Ident(s) => f.write_str(s),
             Tok::String(s) => write!(f, "'{s}'"),
             Tok::LParen => f.write_str("("),
@@ -29,6 +33,8 @@ impl std::fmt::Display for Tok<'_> {
             Tok::Semicolon => f.write_str(";"),
             Tok::Comma => f.write_str(","),
             Tok::DoubleEq => f.write_str("=="),
+            Tok::At => f.write_str("@"),
+            Tok::Slash => f.write_str("/"),
         }?;
         f.write_str("'")
     }
@@ -47,6 +53,8 @@ fn scan(code: &str) -> Vec<(Tok, usize)> {
             ':' => Some(Tok::Colon),
             ';' => Some(Tok::Semicolon),
             ',' => Some(Tok::Comma),
+            '@' => Some(Tok::At),
+            '/' => Some(Tok::Slash),
             _ => None,
         };
         let is_comment = c == '#';
@@ -56,7 +64,10 @@ fn scan(code: &str) -> Vec<(Tok, usize)> {
                 let tok = match &code[i..j] {
                     "==" => Tok::DoubleEq,
                     kw @ ("if" | "else") => Tok::Keyword(kw),
-                    _ => Tok::Ident(&code[i..j]),
+                    _ => match &code[i..j].parse::<usize>() {
+                        Ok(n) => Tok::Num(*n),
+                        Err(_) => Tok::Ident(&code[i..j]),
+                    },
                 };
                 toks.push((tok, i));
             }
@@ -81,7 +92,7 @@ enum Expr {
     Var(String),
     String(String),
     Eq([Box<Expr>; 2]),
-    TimeLoop(Vec<Expr>),
+    TimeLoop(Vec<Expr>, usize, usize),
     Lambda(String, Box<Expr>),
     App([Box<Expr>; 2]),
 }
@@ -155,7 +166,31 @@ fn parse(code: &str) -> Result<Expr, String> {
                     exprs.push(parse_expr(toks)?);
                 }
                 expect(toks, Tok::RBracket)?;
-                Ok(Expr::TimeLoop(exprs))
+                let mut step = 0;
+                let mut phase = 0;
+                if let Some((Tok::At, _)) = toks.peek() {
+                    toks.next();
+                    step = match toks.next() {
+                        Some((Tok::Num(step), _)) => step,
+                        Some((t, i)) => {
+                            return Err((format!("Expected a number, but found {t}"), Some(i)));
+                        }
+                        None => {
+                            return Err((format!("Expected a number, but the code ended"), None));
+                        }
+                    };
+                    expect(toks, Tok::Slash)?;
+                    phase = match toks.next() {
+                        Some((Tok::Num(phase), _)) => phase,
+                        Some((t, i)) => {
+                            return Err((format!("Expected a number, but found {t}"), Some(i)));
+                        }
+                        None => {
+                            return Err((format!("Expected a number, but the code ended"), None));
+                        }
+                    };
+                }
+                Ok(Expr::TimeLoop(exprs, step, phase))
             }
             Tok::RParen
             | Tok::RBracket
@@ -163,6 +198,9 @@ fn parse(code: &str) -> Result<Expr, String> {
             | Tok::Semicolon
             | Tok::Comma
             | Tok::DoubleEq
+            | Tok::At
+            | Tok::Slash
+            | Tok::Num(_)
             | Tok::Keyword(_) => Err((format!("Expected an expression, found {tok}"), Some(i))),
         }
     }
@@ -253,7 +291,7 @@ impl std::fmt::Display for Val {
                     write!(f, "{val}")?;
                 }
                 f.write_str("]")?;
-                if *step > 0 || *phase != vals.len() {
+                if *step != 0 || *phase != 0 {
                     write!(f, "@{step}/{phase}")?;
                 }
                 Ok(())
@@ -297,34 +335,45 @@ fn eq(a: &Val, b: &Val) -> Result<Val, String> {
             Val::TimeLoop {
                 vals: vals_a,
                 step: step_a,
-                ..
+                phase: phase_a,
             },
             Val::TimeLoop {
                 vals: vals_b,
                 step: step_b,
-                ..
+                phase: phase_b,
             },
         ) => {
-            if step_a != step_b {
-                return Ok(_false());
+            if *step_a != 0 || *step_b != 0 {
+                return Err(format!(
+                    "Cannot compare time loops at steps {step_a} and {step_b}"
+                ));
             }
-            let vals = if depth_a > depth_b {
-                vals_a.iter().map(|a| eq(a, b)).collect::<Result<_, _>>()?
+            let (vals, phase) = if depth_a > depth_b {
+                (
+                    vals_a.iter().map(|a| eq(a, b)).collect::<Result<_, _>>()?,
+                    *phase_a,
+                )
             } else if depth_a < depth_b {
-                vals_b.iter().map(|b| eq(a, b)).collect::<Result<_, _>>()?
+                (
+                    vals_b.iter().map(|b| eq(a, b)).collect::<Result<_, _>>()?,
+                    *phase_b,
+                )
             } else {
                 let n = vals_a.len() * vals_b.len();
                 let x: Vec<&Val> = vals_a.into_iter().cycle().take(n).collect();
                 let y: Vec<&Val> = vals_b.into_iter().cycle().take(n).collect();
-                x.into_iter()
-                    .zip(y.into_iter())
-                    .map(|(x, y)| eq(x, y))
-                    .collect::<Result<_, _>>()?
+                (
+                    x.into_iter()
+                        .zip(y.into_iter())
+                        .map(|(x, y)| eq(x, y))
+                        .collect::<Result<_, _>>()?,
+                    0,
+                )
             };
             let vals = simplify_time_loop(vals);
             Ok(Val::TimeLoop {
-                step: *step_a,
-                phase: vals.len(),
+                step: 0,
+                phase,
                 vals,
             })
         }
@@ -351,9 +400,14 @@ fn app(f: Val, arg: Val) -> Result<Val, String> {
             );
             Ok(Val::TimeLoop { vals, step, phase })
         }
-        (Val::TimeLoop { vals: fs, step, .. }, Val::TimeLoop { vals: args, .. })
-            if depth_f == depth_arg =>
-        {
+        (
+            Val::TimeLoop {
+                vals: fs,
+                step,
+                phase,
+            },
+            Val::TimeLoop { vals: args, .. },
+        ) if depth_f == depth_arg => {
             let n = fs.len() * args.len();
             let x: Vec<Val> = fs.into_iter().cycle().take(n).collect();
             let y: Vec<Val> = args.into_iter().cycle().take(n).collect();
@@ -363,7 +417,6 @@ fn app(f: Val, arg: Val) -> Result<Val, String> {
                     .map(|(f, arg)| app(f, arg))
                     .collect::<Result<_, _>>()?,
             );
-            let phase = vals.len();
             Ok(Val::TimeLoop { vals, step, phase })
         }
         (Val::TimeLoop { vals, step, phase }, arg) => {
@@ -388,9 +441,9 @@ impl Expr {
                 let b = b.eval(env)?;
                 eq(&a, &b)
             }
-            Expr::TimeLoop(vals) => Ok(Val::TimeLoop {
-                step: 0,
-                phase: vals.len(),
+            Expr::TimeLoop(vals, step, phase) => Ok(Val::TimeLoop {
+                step,
+                phase,
                 vals: vals
                     .into_iter()
                     .map(|v| v.eval(env))
@@ -401,17 +454,19 @@ impl Expr {
                 let f = f.eval(env)?;
                 let mut arg = arg.eval(env)?;
                 if let Val::TimeLoop { vals, step, phase } = &mut arg {
-                    if *step == 0 {
+                    if *phase != 0 && *step == 0 {
                         vals.rotate_left(1);
-                        *step += 1;
+                        *step = *phase;
                     }
                 }
                 let mut result = app(f, arg)?;
                 if let Val::TimeLoop { vals, step, phase } = &mut result {
-                    *step += 1;
-                    if step == phase {
-                        *step = 0;
-                        vals.rotate_right(1);
+                    if *phase != 0 {
+                        *step += 1;
+                        if step == phase {
+                            *step = 0;
+                            vals.rotate_right(1);
+                        }
                     }
                 }
                 Ok(result)
@@ -461,8 +516,8 @@ mod tests {
     }
 
     #[test]
-    fn liar() -> Result<(), String> {
-        let v = "['x'; 'y']";
+    fn simple_liar() -> Result<(), String> {
+        let v = "['x'; 'y']@0/2";
         let code = format!(
             "
         if {v} == 'x':
@@ -477,7 +532,7 @@ mod tests {
 
     #[test]
     fn captured_liar() -> Result<(), String> {
-        let v = "[['x']; ['y'; 'x']]";
+        let v = "[['x']; ['y'; 'x']]@0/2";
         let code = format!(
             "
         if {v} == ['x'; 'y']:
@@ -492,7 +547,7 @@ mod tests {
 
     #[test]
     fn escaped_liar1() -> Result<(), String> {
-        let v = "[['x']; ['x'; 'y']]";
+        let v = "[['x']; ['x'; 'y']]@0/2";
         let code = format!(
             "
         if {v} == ['x'; 'y']:
@@ -510,7 +565,7 @@ mod tests {
 
     #[test]
     fn escaped_liar2() -> Result<(), String> {
-        let v = "[['y']; ['x'; 'y']]";
+        let v = "[['y']; ['x'; 'y']]@0/2";
         let code = format!(
             "
         if {v} == ['x'; 'y']:
@@ -528,13 +583,7 @@ mod tests {
 
     #[test]
     fn escaped_liar3() -> Result<(), String> {
-        let v = "[['x']; ['z'; 'y']; ['x'; 'z']; ['z'; 'x']; ['x'; 'y']; ['z']]";
-        // x -> [z; y]
-        // [z; y] -> [x; z]
-        // [x; z] -> [z; x]
-        // [z; x] -> [x; y]
-        // [x; y] -> z
-        // z -> x
+        let v = "[['x']; ['z'; 'y']; ['x'; 'z']; ['z'; 'x']; ['x'; 'y']; ['z']]@0/2";
         let code = format!(
             "
         if {v} == ['x'; 'y']:
@@ -552,7 +601,7 @@ mod tests {
 
     #[test]
     fn liar_twin1() -> Result<(), String> {
-        let v = "['x'; 'y']";
+        let v = "['x'; 'y']@0/2";
         let code = format!(
             "
         if {v} == 'x':
@@ -570,7 +619,7 @@ mod tests {
 
     #[test]
     fn liar_twin2() -> Result<(), String> {
-        let v = "['x'; 'y']";
+        let v = "['x'; 'y']@0/2";
         let code = format!(
             "
         if {v} == 'x':
